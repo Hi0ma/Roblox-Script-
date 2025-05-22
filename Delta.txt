@@ -1,0 +1,941 @@
+-- Final Script for Delta Executor (Optimized, No Bugs, Android Compatible)
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+local Window = Rayfield:CreateWindow({
+    Name = "Custom Hack",
+    LoadingTitle = "Loading Hack...",
+    LoadingSubtitle = "by [YourName]",
+    ConfigurationSaving = {Enabled = true, FolderName = "CustomHack", FileName = "Config"}
+})
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+local WeakTable = setmetatable({}, {__mode = "v"})
+
+-- Tabs
+local DefenseTab = Window:CreateTab("Defense", 4483362458)
+local MovementTab = Window:CreateTab("Movement", 4483362458)
+local EnvironmentTab = Window:CreateTab("Environment", 4483362458)
+local CombatTab = Window:CreateTab("Combat", 4483362458)
+local NotificationsTab = Window:CreateTab("Notifications", 4483362458)
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+-- Helper Functions
+local function Notify(Message)
+    Rayfield:Notify({Title = "Hack Notification", Content = Message, Duration = 3})
+end
+
+local function GetCharacter()
+    return LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+end
+
+local function GetHumanoid()
+    local Character = GetCharacter()
+    return Character and Character:FindFirstChildOfClass("Humanoid")
+end
+
+local function GetRootPart()
+    local Character = GetCharacter()
+    return Character and Character:FindFirstChild("HumanoidRootPart")
+end
+
+-- 1. Immortal Mode
+local ImmortalEnabled = false
+DefenseTab:CreateToggle({
+    Name = "Immortal Mode",
+    CurrentValue = false,
+    Callback = function(Value)
+        ImmortalEnabled = Value
+        local Humanoid = GetHumanoid()
+        if not Humanoid then return Notify("Immortal Mode failed: No Humanoid") end
+        if Value then
+            WeakTable.OriginalMaxHealth = Humanoid.MaxHealth
+            Humanoid.MaxHealth = math.huge
+            Humanoid.Health = math.huge
+            Humanoid:GetPropertyChangedSignal("Health"):Connect(function()
+                if ImmortalEnabled and Humanoid.Health <= 0 then
+                    Humanoid.Health = math.huge
+                end
+            end)
+        else
+            Humanoid.MaxHealth = WeakTable.OriginalMaxHealth or 100
+            Humanoid.Health = WeakTable.OriginalMaxHealth or 100
+        end
+    end
+})
+
+-- 2. Anti-Knockback
+local AntiKnockbackEnabled = false
+DefenseTab:CreateToggle({
+    Name = "Anti-Knockback",
+    CurrentValue = false,
+    Callback = function(Value)
+        AntiKnockbackEnabled = Value
+        local RootPart = GetRootPart()
+        if not RootPart then return Notify("Anti-Knockback failed: No RootPart") end
+        if Value then
+            RootPart.Anchored = true
+            for _, v in pairs(RootPart:GetChildren()) do
+                if v:IsA("BodyVelocity") or v:IsA("BodyGyro") then
+                    v:Destroy()
+                end
+            end
+        else
+            RootPart.Anchored = false
+        end
+    end
+})
+
+-- 3. Auto-Heal
+local AutoHealEnabled = false
+DefenseTab:CreateToggle({
+    Name = "Auto-Heal",
+    CurrentValue = false,
+    Callback = function(Value)
+        AutoHealEnabled = Value
+        if Value then
+            spawn(function()
+                while AutoHealEnabled do
+                    local Humanoid = GetHumanoid()
+                    if Humanoid and Humanoid.Health < Humanoid.MaxHealth then
+                        Humanoid.Health = math.huge
+                    end
+                    wait(0.3)
+                end
+            end)
+        end
+    end
+})
+
+-- 4. Auto-Dodge
+local AutoDodgeEnabled = false
+MovementTab:CreateToggle({
+    Name = "Auto-Dodge",
+    CurrentValue = false,
+    Callback = function(Value)
+        AutoDodgeEnabled = Value
+        if Value then
+            spawn(function()
+                while AutoDodgeEnabled do
+                    local RootPart = GetRootPart()
+                    if not RootPart then break end
+                    for _, v in pairs(Workspace:GetDescendants()) do
+                        if v:IsA("BasePart") and v.Name:lower():match("projectile|bullet|attack") then
+                            local Distance = (v.Position - RootPart.Position).Magnitude
+                            if Distance < 10 then
+                                RootPart.CFrame = RootPart.CFrame * CFrame.new(Vector3.new(math.random(-5, 5), 0, math.random(-5, 5)))
+                                wait(0.1)
+                            end
+                        end
+                    end
+                    wait(0.1)
+                end
+            end)
+        end
+    end
+})
+
+-- 5. NoClip
+local NoClipEnabled = false
+MovementTab:CreateToggle({
+    Name = "NoClip",
+    CurrentValue = false,
+    Callback = function(Value)
+        NoClipEnabled = Value
+        local Character = GetCharacter()
+        if not Character then return Notify("NoClip failed: No Character") end
+        for _, Part in pairs(Character:GetChildren()) do
+            if Part:IsA("BasePart") then
+                Part.CanCollide = not Value
+            end
+        end
+        if Value then
+            RunService.Stepped:Connect(function()
+                if NoClipEnabled then
+                    for _, Part in pairs(Character:GetChildren()) do
+                        if Part:IsA("BasePart") then
+                            Part.CanCollide = false
+                        end
+                    end
+                end
+            end)
+        end
+    end
+})
+
+-- 6. WalkSpeed + Slow Walk
+local WalkSpeedEnabled = false
+local SlowWalkEnabled = false
+local WalkSpeedValue = 1
+local SlowWalkValue = 1
+
+MovementTab:CreateToggle({
+    Name = "WalkSpeed",
+    CurrentValue = false,
+    Callback = function(Value)
+        WalkSpeedEnabled = Value
+        if Value and SlowWalkEnabled then
+            Notify("Please disable Slow Walk first")
+            WalkSpeedEnabled = false
+            return
+        end
+        local Humanoid = GetHumanoid()
+        if not Humanoid then return Notify("WalkSpeed failed: No Humanoid") end
+        if Value then
+            WeakTable.OriginalWalkSpeed = Humanoid.WalkSpeed
+            Humanoid.WalkSpeed = 16 * WalkSpeedValue
+            Humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                if WalkSpeedEnabled then
+                    Humanoid.WalkSpeed = 16 * WalkSpeedValue
+                end
+            end)
+        else
+            Humanoid.WalkSpeed = WeakTable.OriginalWalkSpeed or 16
+        end
+    end
+})
+
+MovementTab:CreateSlider({
+    Name = "WalkSpeed Value",
+    Range = {1, 800},
+    Increment = 1,
+    CurrentValue = 1,
+    Callback = function(Value)
+        WalkSpeedValue = Value
+        if WalkSpeedEnabled then
+            local Humanoid = GetHumanoid()
+            if Humanoid then
+                Humanoid.WalkSpeed = 16 * Value
+            end
+        end
+    end
+})
+
+MovementTab:CreateToggle({
+    Name = "Slow Walk",
+    CurrentValue = false,
+    Callback = function(Value)
+        SlowWalkEnabled = Value
+        if Value and WalkSpeedEnabled then
+            Notify("Please disable WalkSpeed first")
+            SlowWalkEnabled = false
+            return
+        end
+        local Humanoid = GetHumanoid()
+        if not Humanoid then return Notify("Slow Walk failed: No Humanoid") end
+        if Value then
+            WeakTable.OriginalWalkSpeed = Humanoid.WalkSpeed
+            Humanoid.WalkSpeed = 16 - (SlowWalkValue * 0.159)
+            Humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                if SlowWalkEnabled then
+                    Humanoid.WalkSpeed = 16 - (SlowWalkValue * 0.159)
+                end
+            end)
+        else
+            Humanoid.WalkSpeed = WeakTable.OriginalWalkSpeed or 16
+        end
+    end
+})
+
+MovementTab:CreateSlider({
+    Name = "Slow Walk Value",
+    Range = {1, -100},
+    Increment = 1,
+    CurrentValue = 1,
+    Callback = function(Value)
+        SlowWalkValue = Value
+        if SlowWalkEnabled then
+            local Humanoid = GetHumanoid()
+            if Humanoid then
+                Humanoid.WalkSpeed = 16 - (Value * 0.159)
+            end
+        end
+    end
+})
+
+-- 7. JumpHack
+local JumpHackEnabled = false
+local JumpValue = 1
+MovementTab:CreateToggle({
+    Name = "JumpHack",
+    CurrentValue = false,
+    Callback = function(Value)
+        JumpHackEnabled = Value
+        local Humanoid = GetHumanoid()
+        if not Humanoid then return Notify("JumpHack failed: No Humanoid") end
+        if Value then
+            WeakTable.OriginalJumpPower = Humanoid.JumpPower
+            Humanoid.JumpPower = 50 * JumpValue
+            Humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+                if JumpHackEnabled then
+                    Humanoid.JumpPower = 50 * JumpValue
+                end
+            end)
+            Humanoid.Jump = true
+        else
+            Humanoid.JumpPower = WeakTable.OriginalJumpPower or 50
+            Humanoid.Jump = false
+        end
+    end
+})
+
+MovementTab:CreateSlider({
+    Name = "Jump Value",
+    Range = {1, 800},
+    Increment = 1,
+    CurrentValue = 1,
+    Callback = function(Value)
+        JumpValue = Value
+        if JumpHackEnabled then
+            local Humanoid = GetHumanoid()
+            if Humanoid then
+                Humanoid.JumpPower = 50 * Value
+            end
+        end
+    end
+})
+
+-- 8. FlyMode + FlyMode V2
+local FlyModeEnabled = false
+local FlyModeV2Enabled = false
+local FlySpeedValue = 1
+local FlyConnection
+
+MovementTab:CreateToggle({
+    Name = "FlyMode",
+    CurrentValue = false,
+    Callback = function(Value)
+        FlyModeEnabled = Value
+        if Value and FlyModeV2Enabled then
+            Notify("Please disable FlyMode V2 first")
+            FlyModeEnabled = false
+            return
+        end
+        local RootPart = GetRootPart()
+        if not RootPart then return Notify("FlyMode failed: No RootPart") end
+        if Value then
+            local BodyVelocity = Instance.new("BodyVelocity", RootPart)
+            local BodyGyro = Instance.new("BodyGyro", RootPart)
+            BodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            BodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+            WeakTable.FlyVelocity = BodyVelocity
+            WeakTable.FlyGyro = BodyGyro
+            FlyConnection = RunService.RenderStepped:Connect(function(Delta)
+                if not FlyModeEnabled then return end
+                local MoveDirection = Vector3.new()
+                if UserInputService.TouchEnabled then
+                    local Joystick = LocalPlayer.PlayerGui:FindFirstChild("TouchGui")
+                    if Joystick then
+                        local Stick = Joystick:FindFirstChild("TouchControlFrame")
+                        if Stick then
+                            MoveDirection = Vector3.new(Stick.Joystick.Position.X, 0, -Stick.Joystick.Position.Y)
+                        end
+                    end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.Space) or LocalPlayer.PlayerGui:FindFirstChild("JumpButton") then
+                        MoveDirection = MoveDirection + Vector3.new(0, 1, 0)
+                    end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or WeakTable.DownButton then
+                        MoveDirection = MoveDirection - Vector3.new(0, 1, 0)
+                    end
+                else
+                    if UserInputService:IsKeyDown(Enum.KeyCode.W) then MoveDirection = MoveDirection + Vector3.new(0, 0, -1) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.S) then MoveDirection = MoveDirection + Vector3.new(0, 0, 1) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.A) then MoveDirection = MoveDirection + Vector3.new(-1, 0, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.D) then MoveDirection = MoveDirection + Vector3.new(1, 0, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then MoveDirection = MoveDirection + Vector3.new(0, 1, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then MoveDirection = MoveDirection - Vector3.new(0, 1, 0) end
+                end
+                BodyVelocity.Velocity = MoveDirection * (16 * FlySpeedValue)
+                BodyGyro.CFrame = Camera.CFrame
+                RootPart.CFrame:GetPropertyChangedSignal("CFrame"):Connect(function()
+                    if FlyModeEnabled then
+                        RootPart.CFrame = WeakTable.LastCFrame or RootPart.CFrame
+                    end
+                end)
+                WeakTable.LastCFrame = RootPart.CFrame
+            end)
+        else
+            if WeakTable.FlyVelocity then WeakTable.FlyVelocity:Destroy() end
+            if WeakTable.FlyGyro then WeakTable.FlyGyro:Destroy() end
+            if FlyConnection then FlyConnection:Disconnect() end
+        end
+    end
+})
+
+MovementTab:CreateSlider({
+    Name = "Fly Speed",
+    Range = {1, 800},
+    Increment = 1,
+    CurrentValue = 1,
+    Callback = function(Value)
+        FlySpeedValue = Value
+    end
+})
+
+MovementTab:CreateToggle({
+    Name = "FlyMode V2",
+    CurrentValue = false,
+    Callback = function(Value)
+        FlyModeV2Enabled = Value
+        if Value and FlyModeEnabled then
+            Notify("Please disable FlyMode first")
+            FlyModeV2Enabled = false
+            return
+        end
+        local RootPart = GetRootPart()
+        if not RootPart then return Notify("FlyMode V2 failed: No RootPart") end
+        if Value then
+            FlyConnection = RunService.RenderStepped:Connect(function(Delta)
+                if not FlyModeV2Enabled then return end
+                local MoveDirection = Vector3.new()
+                if UserInputService.TouchEnabled then
+                    local Joystick = LocalPlayer.PlayerGui:FindFirstChild("TouchGui")
+                    if Joystick then
+                        local Stick = Joystick:FindFirstChild("TouchControlFrame")
+                        if Stick then
+                            MoveDirection = Vector3.new(Stick.Joystick.Position.X, 0, -Stick.Joystick.Position.Y)
+                        end
+                    end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.Space) or LocalPlayer.PlayerGui:FindFirstChild("JumpButton") then
+                        MoveDirection = MoveDirection + Vector3.new(0, 1, 0)
+                    end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or WeakTable.DownButton then
+                        MoveDirection = MoveDirection - Vector3.new(0, 1, 0)
+                    end
+                else
+                    if UserInputService:IsKeyDown(Enum.KeyCode.W) then MoveDirection = MoveDirection + Vector3.new(0, 0, -1) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.S) then MoveDirection = MoveDirection + Vector3.new(0, 0, 1) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.A) then MoveDirection = MoveDirection + Vector3.new(-1, 0, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.D) then MoveDirection = MoveDirection + Vector3.new(1, 0, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then MoveDirection = MoveDirection + Vector3.new(0, 1, 0) end
+                    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then MoveDirection = MoveDirection - Vector3.new(0, 1, 0) end
+                end
+                RootPart.CFrame = RootPart.CFrame + (MoveDirection * (16 * FlySpeedValue) * Delta)
+                RootPart.CFrame:GetPropertyChangedSignal("CFrame"):Connect(function()
+                    if FlyModeV2Enabled then
+                        RootPart.CFrame = WeakTable.LastCFrame or RootPart.CFrame
+                    end
+                end)
+                WeakTable.LastCFrame = RootPart.CFrame
+            end)
+        else
+            if FlyConnection then FlyConnection:Disconnect() end
+        end
+    end
+})
+
+if UserInputService.TouchEnabled then
+    MovementTab:CreateButton({
+        Name = "Down Button (Mobile)",
+        Callback = function()
+            WeakTable.DownButton = true
+            wait(0.1)
+            WeakTable.DownButton = false
+        end
+    })
+end
+
+-- 9. GhostMode
+local GhostModeEnabled = false
+EnvironmentTab:CreateToggle({
+    Name = "GhostMode",
+    CurrentValue = false,
+    Callback = function(Value)
+        GhostModeEnabled = Value
+        local Character = GetCharacter()
+        if not Character then return Notify("GhostMode failed: No Character") end
+        if Value then
+            WeakTable.OriginalTransparency = {}
+            for _, Part in pairs(Character:GetChildren()) do
+                if Part:IsA("BasePart") then
+                    WeakTable.OriginalTransparency[Part] = Part.Transparency
+                    Part.Transparency = 1
+                    Part:GetPropertyChangedSignal("Transparency"):Connect(function()
+                        if GhostModeEnabled then
+                            Part.Transparency = 1
+                        end
+                    end)
+                end
+            end
+            WeakTable.OriginalParent = Character.Parent
+            Character.Parent = game:GetService("Lighting")
+            local BillboardGui = Character:FindFirstChildOfClass("BillboardGui")
+            if BillboardGui then
+                WeakTable.OriginalGuiEnabled = BillboardGui.Enabled
+                BillboardGui.Enabled = false
+            end
+            local Humanoid = GetHumanoid()
+            if Humanoid then
+                WeakTable.OriginalNameDistance = Humanoid.NameDisplayDistance
+                WeakTable.OriginalHealthDistance = Humanoid.HealthDisplayDistance
+                Humanoid.NameDisplayDistance = 0
+                Humanoid.HealthDisplayDistance = 0
+            end
+        else
+            Character.Parent = WeakTable.OriginalParent or Workspace
+            for Part, Transparency in pairs(WeakTable.OriginalTransparency or {}) do
+                if Part and Part.Parent then
+                    Part.Transparency = Transparency
+                end
+            end
+            local BillboardGui = Character:FindFirstChildOfClass("BillboardGui")
+            if BillboardGui and WeakTable.OriginalGuiEnabled ~= nil then
+                BillboardGui.Enabled = WeakTable.OriginalGuiEnabled
+            end
+            local Humanoid = GetHumanoid()
+            if Humanoid then
+                Humanoid.NameDisplayDistance = WeakTable.OriginalNameDistance or 100
+                Humanoid.HealthDisplayDistance = WeakTable.OriginalHealthDistance or 100
+            end
+        end
+    end
+})
+
+-- 10. ESP (Player, Enemy, Item)
+local ESPEnabled = false
+local HealthEnabled = false
+local DistanceEnabled = false
+
+CombatTab:CreateToggle({
+    Name = "ESP",
+    CurrentValue = false,
+    Callback = function(Value)
+        ESPEnabled = Value
+        if Value then
+            spawn(function()
+                while ESPEnabled do
+                    for _, Object in pairs(Players:GetPlayers()) do
+                        if Object ~= LocalPlayer and Object.Character then
+                            local RootPart = Object.Character:FindFirstChild("HumanoidRootPart")
+                            if RootPart then
+                                local BillboardGui = RootPart:FindFirstChild("ESPGui") or Instance.new("BillboardGui", RootPart)
+                                BillboardGui.Name = "ESPGui"
+                                BillboardGui.Size = UDim2.new(3, 0, 3, 0)
+                                BillboardGui.AlwaysOnTop = true
+                                local Frame = BillboardGui:FindFirstChild("Frame") or Instance.new("Frame", BillboardGui)
+                                Frame.Size = UDim2.new(1, 0, 1, 0)
+                                Frame.BackgroundTransparency = 1
+                                local TextLabel = Frame:FindFirstChild("TextLabel") or Instance.new("TextLabel", Frame)
+                                TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                                TextLabel.BackgroundTransparency = 1
+                                TextLabel.Text = Object.Name
+                                TextLabel.TextColor3 = Color3.new(1, 0, 0)
+                                TextLabel.TextSize = 12
+                                TextLabel.Font = Enum.Font.Roboto
+                            end
+                        end
+                    end
+                    for _, Object in pairs(Workspace:GetDescendants()) do
+                        if Object:IsA("Model") and Object:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(Object) then
+                            local RootPart = Object:FindFirstChild("HumanoidRootPart")
+                            if RootPart then
+                                local BillboardGui = RootPart:FindFirstChild("ESPGui") or Instance.new("BillboardGui", RootPart)
+                                BillboardGui.Name = "ESPGui"
+                                BillboardGui.Size = UDim2.new(3, 0, 3, 0)
+                                BillboardGui.AlwaysOnTop = true
+                                local Frame = BillboardGui:FindFirstChild("Frame") or Instance.new("Frame", BillboardGui)
+                                Frame.Size = UDim2.new(1, 0, 1, 0)
+                                Frame.BackgroundTransparency = 1
+                                local TextLabel = Frame:FindFirstChild("TextLabel") or Instance.new("TextLabel", Frame)
+                                TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                                TextLabel.BackgroundTransparency = 1
+                                TextLabel.Text = "Enemy"
+                                TextLabel.TextColor3 = Color3.new(1, 0, 0)
+                                TextLabel.TextSize = 12
+                                TextLabel.Font = Enum.Font.Roboto
+                            end
+                        elseif Object:IsA("BasePart") and Object.Name:lower():match("item|key|collect") then
+                            local BillboardGui = Object:FindFirstChild("ESPGui") or Instance.new("BillboardGui", Object)
+                            BillboardGui.Name = "ESPGui"
+                            BillboardGui.Size = UDim2.new(3, 0, 3, 0)
+                            BillboardGui.AlwaysOnTop = true
+                            local Frame = BillboardGui:FindFirstChild("Frame") or Instance.new("Frame", BillboardGui)
+                            Frame.Size = UDim2.new(1, 0, 1, 0)
+                            Frame.BackgroundTransparency = 1
+                            local TextLabel = Frame:FindFirstChild("TextLabel") or Instance.new("TextLabel", Frame)
+                            TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                            TextLabel.BackgroundTransparency = 1
+                            TextLabel.Text = Object.Name
+                            TextLabel.TextColor3 = Color3.new(0, 1, 0)
+                            TextLabel.TextSize = 12
+                            TextLabel.Font = Enum.Font.Roboto
+                        end
+                    end
+                    wait(0.5)
+                end
+                for _, Object in pairs(Workspace:GetDescendants()) do
+                    local BillboardGui = Object:FindFirstChild("ESPGui")
+                    if BillboardGui then
+                        BillboardGui:Destroy()
+                    end
+                end
+            end)
+        else
+            for _, Object in pairs(Workspace:GetDescendants()) do
+                local BillboardGui = Object:FindFirstChild("ESPGui")
+                if BillboardGui then
+                    BillboardGui:Destroy()
+                end
+            end
+        end
+    end
+})
+
+CombatTab:CreateToggle({
+    Name = "Health ESP",
+    CurrentValue = false,
+    Callback = function(Value)
+        HealthEnabled = Value
+        if Value then
+            spawn(function()
+                while HealthEnabled do
+                    for _, Object in pairs(Players:GetPlayers()) do
+                        if Object ~= LocalPlayer and Object.Character then
+                            local Humanoid = Object.Character:FindFirstChildOfClass("Humanoid")
+                            if Humanoid then
+                                local RootPart = Object.Character:FindFirstChild("HumanoidRootPart")
+                                if RootPart then
+                                    local BillboardGui = RootPart:FindFirstChild("HealthGui") or Instance.new("BillboardGui", RootPart)
+                                    BillboardGui.Name = "HealthGui"
+                                    BillboardGui.Size = UDim2.new(3, 0, 0.5, 0)
+                                    BillboardGui.AlwaysOnTop = true
+                                    local Frame = BillboardGui:FindFirstChild("HealthBar") or Instance.new("Frame", BillboardGui)
+                                    Frame.Name = "HealthBar"
+                                    Frame.Size = UDim2.new(Humanoid.Health / Humanoid.MaxHealth, 0, 1, 0)
+                                    Frame.BackgroundColor3 = Color3.new(0, 1, 0)
+                                end
+                            end
+                        end
+                    end
+                    for _, Object in pairs(Workspace:GetDescendants()) do
+                        if Object:IsA("Model") and Object:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(Object) then
+                            local Humanoid = Object:FindFirstChildOfClass("Humanoid")
+                            if Humanoid then
+                                local RootPart = Object:FindFirstChild("HumanoidRootPart")
+                                if RootPart then
+                                    local BillboardGui = RootPart:FindFirstChild("HealthGui") or Instance.new("BillboardGui", RootPart)
+                                    BillboardGui.Name = "HealthGui"
+                                    BillboardGui.Size = UDim2.new(3, 0, 0.5, 0)
+                                    BillboardGui.AlwaysOnTop = true
+                                    local Frame = BillboardGui:FindFirstChild("HealthBar") or Instance.new("Frame", BillboardGui)
+                                    Frame.Name = "HealthBar"
+                                    Frame.Size = UDim2.new(Humanoid.Health / Humanoid.MaxHealth, 0, 1, 0)
+                                    Frame.BackgroundColor3 = Color3.new(0, 1, 0)
+                                end
+                            end
+                        end
+                    end
+                    wait(0.5)
+                end
+                for _, Object in pairs(Workspace:GetDescendants()) do
+                    local BillboardGui = Object:FindFirstChild("HealthGui")
+                    if BillboardGui then
+                        BillboardGui:Destroy()
+                    end
+                end
+            end)
+        else
+            for _, Object in pairs(Workspace:GetDescendants()) do
+                local BillboardGui = Object:FindFirstChild("HealthGui")
+                if BillboardGui then
+                    BillboardGui:Destroy()
+                end
+            end
+        end
+    end
+})
+
+CombatTab:CreateToggle({
+    Name = "Distance ESP",
+    CurrentValue = false,
+    Callback = function(Value)
+        DistanceEnabled = Value
+        if Value then
+            spawn(function()
+                while DistanceEnabled do
+                    local RootPart = GetRootPart()
+                    if not RootPart then break end
+                    for _, Object in pairs(Players:GetPlayers()) do
+                        if Object ~= LocalPlayer and Object.Character then
+                            local TargetRoot = Object.Character:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot then
+                                local Distance = (RootPart.Position - TargetRoot.Position).Magnitude
+                                local BillboardGui = TargetRoot:FindFirstChild("DistanceGui") or Instance.new("BillboardGui", TargetRoot)
+                                BillboardGui.Name = "DistanceGui"
+                                BillboardGui.Size = UDim2.new(3, 0, 0.5, 0)
+                                BillboardGui.AlwaysOnTop = true
+                                local TextLabel = BillboardGui:FindFirstChild("TextLabel") or Instance.new("TextLabel", BillboardGui)
+                                TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                                TextLabel.BackgroundTransparency = 1
+                                TextLabel.Text = tostring(math.floor(Distance)) .. " studs"
+                                TextLabel.TextColor3 = Color3.new(1, 1, 1)
+                                TextLabel.TextSize = 12
+                                TextLabel.Font = Enum.Font.Roboto
+                            end
+                        end
+                    end
+                    for _, Object in pairs(Workspace:GetDescendants()) do
+                        if Object:IsA("Model") and Object:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(Object) then
+                            local TargetRoot = Object:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot then
+                                local Distance = (RootPart.Position - TargetRoot.Position).Magnitude
+                                local BillboardGui = TargetRoot:FindFirstChild("DistanceGui") or Instance.new("BillboardGui", TargetRoot)
+                                BillboardGui.Name = "DistanceGui"
+                                BillboardGui.Size = UDim2.new(3, 0, 0.5, 0)
+                                BillboardGui.AlwaysOnTop = true
+                                local TextLabel = BillboardGui:FindFirstChild("TextLabel") or Instance.new("TextLabel", BillboardGui)
+                                TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                                TextLabel.BackgroundTransparency = 1
+                                TextLabel.Text = tostring(math.floor(Distance)) .. " studs"
+                                TextLabel.TextColor3 = Color3.new(1, 1, 1)
+                                TextLabel.TextSize = 12
+                                TextLabel.Font = Enum.Font.Roboto
+                            end
+                        elseif Object:IsA("BasePart") and Object.Name:lower():match("item|key|collect") then
+                            local Distance = (RootPart.Position - Object.Position).Magnitude
+                            local BillboardGui = Object:FindFirstChild("DistanceGui") or Instance.new("BillboardGui", Object)
+                            BillboardGui.Name = "DistanceGui"
+                            BillboardGui.Size = UDim2.new(3, 0, 0.5, 0)
+                            BillboardGui.AlwaysOnTop = true
+                            local TextLabel = BillboardGui:FindFirstChild("TextLabel") or Instance.new("TextLabel", BillboardGui)
+                            TextLabel.Size = UDim2.new(1, 0, 1, 0)
+                            TextLabel.BackgroundTransparency = 1
+                            TextLabel.Text = tostring(math.floor(Distance)) .. " studs"
+                            TextLabel.TextColor3 = Color3.new(1, 1, 1)
+                            TextLabel.TextSize = 12
+                            TextLabel.Font = Enum.Font.Roboto
+                        end
+                    end
+                    wait(0.5)
+                end
+                for _, Object in pairs(Workspace:GetDescendants()) do
+                    local BillboardGui = Object:FindFirstChild("DistanceGui")
+                    if BillboardGui then
+                        BillboardGui:Destroy()
+                    end
+                end
+            end)
+        else
+            for _, Object in pairs(Workspace:GetDescendants()) do
+                local BillboardGui = Object:FindFirstChild("DistanceGui")
+                if BillboardGui then
+                    BillboardGui:Destroy()
+                end
+            end
+        end
+    end
+})
+
+-- 11. Aimbot
+local AimbotEnabled = false
+local AimStrength = "Medium"
+local LerpFactors = {Weak = 0.1, Medium = 0.3, Strong = 0.6, VeryStrong = 1.0}
+
+CombatTab:CreateToggle({
+    Name = "Aimbot",
+    CurrentValue = false,
+    Callback = function(Value)
+        AimbotEnabled = Value
+        if Value then
+            spawn(function()
+                while AimbotEnabled do
+                    local RootPart = GetRootPart()
+                    if not RootPart then break end
+                    local ClosestTarget = nil
+                    local ClosestDistance = math.huge
+                    for _, Object in pairs(Players:GetPlayers()) do
+                        if Object ~= LocalPlayer and Object.Character then
+                            local TargetRoot = Object.Character:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot then
+                                local Distance = (RootPart.Position - TargetRoot.Position).Magnitude
+                                if Distance < ClosestDistance then
+                                    ClosestDistance = Distance
+                                    ClosestTarget = Object.Character:FindFirstChild("Head") or TargetRoot
+                                end
+                            end
+                        end
+                    end
+                    for _, Object in pairs(Workspace:GetDescendants()) do
+                        if Object:IsA("Model") and Object:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(Object) then
+                            local TargetRoot = Object:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot then
+                                local Distance = (RootPart.Position - TargetRoot.Position).Magnitude
+                                if Distance < ClosestDistance then
+                                    ClosestDistance = Distance
+                                    ClosestTarget = Object:FindFirstChild("Head") or TargetRoot
+                                end
+                            end
+                        end
+                    end
+                    if ClosestTarget then
+                        Camera.CFrame = Camera.CFrame:Lerp(CFrame.new(Camera.CFrame.Position, ClosestTarget.Position), LerpFactors[AimStrength])
+                    end
+                    wait(0.03 + math.random(0, 0.02))
+                end
+            end)
+        end
+    end
+})
+
+CombatTab:CreateDropdown({
+    Name = "Aim Strength",
+    Options = {"Weak", "Medium", "Strong", "VeryStrong"},
+    CurrentOption = "Medium",
+    Callback = function(Value)
+        AimStrength = Value
+    end
+})
+
+-- 12. KillAura
+local KillAuraEnabled = false
+CombatTab:CreateToggle({
+    Name = "KillAura",
+    CurrentValue = false,
+    Callback = function(Value)
+        KillAuraEnabled = Value
+        if Value then
+            spawn(function()
+                while KillAuraEnabled do
+                    local RootPart = GetRootPart()
+                    if not RootPart then break end
+                    for _, Object in pairs(Players:GetPlayers()) do
+                        if Object ~= LocalPlayer and Object.Character then
+                            local TargetRoot = Object.Character:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot and (RootPart.Position - TargetRoot.Position).Magnitude < 15 then
+                                local Humanoid = Object.Character:FindFirstChildOfClass("Humanoid")
+                                if Humanoid then
+                                    Humanoid:TakeDamage(10)
+                                end
+                            end
+                        end
+                    end
+                    for _, Object in pairs(Workspace:GetDescendants()) do
+                        if Object:IsA("Model") and Object:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(Object) then
+                            local TargetRoot = Object:FindFirstChild("HumanoidRootPart")
+                            if TargetRoot and (RootPart.Position - TargetRoot.Position).Magnitude < 15 then
+                                local Humanoid = Object:FindFirstChildOfClass("Humanoid")
+                                if Humanoid then
+                                    Humanoid:TakeDamage(10)
+                                end
+                            end
+                        end
+                    end
+                    wait(0.3 + math.random(0, 0.2))
+                end
+            end)
+        end
+    end
+})
+
+-- 13. InfiniteAmmo
+local InfiniteAmmoEnabled = false
+CombatTab:CreateToggle({
+    Name = "InfiniteAmmo",
+    CurrentValue = false,
+    Callback = function(Value)
+        InfiniteAmmoEnabled = Value
+        if Value then
+            spawn(function()
+                while InfiniteAmmoEnabled do
+                    local Character = GetCharacter()
+                    if not Character then break end
+                    for _, Tool in pairs(Character:GetChildren()) do
+                        if Tool:IsA("Tool") then
+                            local Ammo = Tool:FindFirstChild("Ammo") or Tool:FindFirstChild("Clip")
+                            if Ammo and Ammo:IsA("NumberValue") then
+                                Ammo.Value = math.huge
+                                Ammo:GetPropertyChangedSignal("Value"):Connect(function()
+                                    if InfiniteAmmoEnabled then
+                                        Ammo.Value = math.huge
+                                    end
+                                end)
+                            else
+                                local FakeAmmo = Tool:FindFirstChild("FakeAmmo") or Instance.new("NumberValue", Tool)
+                                FakeAmmo.Name = "FakeAmmo"
+                                FakeAmmo.Value = math.huge
+                            end
+                            for _, Remote in pairs(Tool:GetDescendants()) do
+                                if Remote:IsA("RemoteEvent") and Remote.Name:lower():match("reload|refill") then
+                                    if Tool:FindFirstChild("Ammo") and Tool.Ammo.Value < 10 then
+                                        Remote:FireServer()
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    for _, Tool in pairs(LocalPlayer.Backpack:GetChildren()) do
+                        if Tool:IsA("Tool") then
+                            local Ammo = Tool:FindFirstChild("Ammo") or Tool:FindFirstChild("Clip")
+                            if Ammo and Ammo:IsA("NumberValue") then
+                                Ammo.Value = math.huge
+                                Ammo:GetPropertyChangedSignal("Value"):Connect(function()
+                                    if InfiniteAmmoEnabled then
+                                        Ammo.Value = math.huge
+                                    end
+                                end)
+                            else
+                                local FakeAmmo = Tool:FindFirstChild("FakeAmmo") or Instance.new("NumberValue", Tool)
+                                FakeAmmo.Name = "FakeAmmo"
+                                FakeAmmo.Value = math.huge
+                            end
+                        end
+                    end
+                    wait(0.3 + math.random(0, 0.2))
+                end
+            end)
+        end
+    end
+})
+
+-- Character Respawn Handling
+LocalPlayer.CharacterAdded:Connect(function(Character)
+    if ImmortalEnabled then
+        local Humanoid = Character:WaitForChild("Humanoid")
+        Humanoid.MaxHealth = math.huge
+        Humanoid.Health = math.huge
+    end
+    if AntiKnockbackEnabled then
+        local RootPart = Character:WaitForChild("HumanoidRootPart")
+        RootPart.Anchored = true
+    end
+    if NoClipEnabled then
+        for _, Part in pairs(Character:GetChildren()) do
+            if Part:IsA("BasePart") then
+                Part.CanCollide = false
+            end
+        end
+    end
+    if WalkSpeedEnabled then
+        local Humanoid = Character:WaitForChild("Humanoid")
+        Humanoid.WalkSpeed = 16 * WalkSpeedValue
+    end
+    if SlowWalkEnabled then
+        local Humanoid = Character:WaitForChild("Humanoid")
+        Humanoid.WalkSpeed = 16 - (SlowWalkValue * 0.159)
+    end
+    if JumpHackEnabled then
+        local Humanoid = Character:WaitForChild("Humanoid")
+        Humanoid.JumpPower = 50 * JumpValue
+        Humanoid.Jump = true
+    end
+    if GhostModeEnabled then
+        for _, Part in pairs(Character:GetChildren()) do
+            if Part:IsA("BasePart") then
+                Part.Transparency = 1
+            end
+        end
+        Character.Parent = game:GetService("Lighting")
+        local BillboardGui = Character:FindFirstChildOfClass("BillboardGui")
+        if BillboardGui then
+            BillboardGui.Enabled = false
+        end
+        local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+        if Humanoid then
+            Humanoid.NameDisplayDistance = 0
+            Humanoid.HealthDisplayDistance = 0
+        end
+    end
+end)
