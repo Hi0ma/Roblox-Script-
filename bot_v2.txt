@@ -1,0 +1,1325 @@
+import sys
+import asyncio
+import os
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
+from typing import Optional, Tuple, Dict, List
+import ccxt.async_support as ccxt
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import time
+from collections import defaultdict
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, Forbidden
+from telegram import InputMediaPhoto
+from tenacity import retry, stop_after_attempt, wait_fixed
+import portalocker
+import ta
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Error logger
+error_handler = RotatingFileHandler('errors.log', mode='a', maxBytes=10*1024*1024, backupCount=5)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(error_handler)
+
+# Event logger
+event_handler = RotatingFileHandler('events.log', mode='a', maxBytes=10*1024*1024, backupCount=5)
+event_handler.setLevel(logging.INFO)
+event_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+event_logger = logging.getLogger('events')
+event_logger.addHandler(event_handler)
+event_logger.setLevel(logging.INFO)
+
+# Configuration
+CONFIG = {
+    "cex_api_key": "mx0vglXmxny6WvxtD0",
+    "cex_secret_key": "29d65e3090e34de6a519cb1495ad1562",
+    "telegram_token": "7702131341:AAE6osPRh2p8CUI1k0skbmDR9TaanM7eVbg",
+    "error_group_id": "-1002813041827",
+    "log_group_id": "-1002766045861",
+    "default_symbol": "BTC/USDT",
+    "admin_id": "5480487713"
+}
+
+class RateLimiter:
+    def __init__(self):
+        self.user_requests = defaultdict(list)
+        self.banned_users = {}
+        self.MAX_REQUESTS = 30
+        self.WARNING_THRESHOLD = 20
+        self.TIME_WINDOW = 60  # seconds
+        self.BAN_DURATION = 3600  # seconds (1 hour)
+
+    def check_rate_limit(self, user_id: str) -> Tuple[bool, Optional[str]]:
+        current_time = time.time()
+        self.user_requests[user_id] = [
+            t for t in self.user_requests[user_id] if current_time - t < self.TIME_WINDOW
+        ]
+        self.user_requests[user_id].append(current_time)
+
+        if user_id in self.banned_users:
+            ban_time = self.banned_users[user_id]
+            if current_time - ban_time < self.BAN_DURATION:
+                remaining = int(self.BAN_DURATION - (current_time - ban_time))
+                return False, f"🚫 **تم حظرك** من استخدام البوت لمدة {remaining // 60} دقيقة بسبب الاستخدام المفرط.\n📌 حاول مرة أخرى بعد انتهاء الحظر."
+            else:
+                del self.banned_users[user_id]
+                self.user_requests[user_id].clear()
+
+        if len(self.user_requests[user_id]) > self.MAX_REQUESTS:
+            self.banned_users[user_id] = current_time
+            return False, f"🚫 **تم حظرك** من استخدام البوت لمدة ساعة بسبب الاستخدام المفرط.\n📌 حاول مرة أخرى بعد انتهاء الحظر."
+        elif len(self.user_requests[user_id]) > self.WARNING_THRESHOLD:
+            return True, f"⚠️ **تحذير**: أنت بتستخدم البوت بسرعة كبيرة!\n📌 لو استمر الاستخدام المفرط، هيتم حظرك لمدة ساعة."
+        return True, None
+
+class TradingBot:
+    def __init__(self, config: Dict[str, str]):
+        self.config = config
+        self.exchange = ccxt.mexc({
+            'apiKey': config['cex_api_key'],
+            'secret': config['cex_secret_key'],
+            'enableRateLimit': True
+        })
+        self.rate_limiter = RateLimiter()
+        self.cached_data = {}
+        self.deal_requests = {}
+        self.application = None
+        self.admin_settings = {
+            'private_enabled': True,
+            'active_group_id': None,
+            'active_group_name': None
+        }
+        self.waiting_for_group_id = False
+        self.features = [
+            'RSI_14', 'RSI_7', 'RSI_21', 'MACD', 'MACD_signal', 'Bollinger_width', 'ATR_14', 'ATR_7',
+            'Stochastic', 'Volume_MA_20', 'Volume_MA_50', 'Ichimoku_tenkan', 'Ichimoku_kijun',
+            'Ichimoku_senkou_a', 'Ichimoku_senkou_b', 'ADX', 'Parabolic_SAR', 'CCI', 'MFI',
+            'Williams_R', 'ROC', 'CMO', 'KAMA', 'PPO', 'TRIX', 'DMI_plus', 'DMI_minus',
+            'MA_10', 'MA_20', 'MA_50', 'MA_100', 'MA_200', 'EMA_10', 'EMA_20', 'EMA_50',
+            'EMA_100', 'EMA_200', 'OBV', 'Chaikin_AD', 'Force_Index', 'Elder_Ray_Bull',
+            'Elder_Ray_Bear', 'VWAP', 'Keltner_Channel', 'Donchian_Channel', 'Aroon_Up',
+            'Aroon_Down', 'Ulcer_Index', 'Chande_Momentum', 'Stoch_RSI', 'Ultimate_Oscillator'
+        ]
+        self.timeframe_durations = {
+            '1m': timedelta(minutes=1),
+            '5m': timedelta(minutes=5),
+            '10m': timedelta(minutes=10),
+            '15m': timedelta(minutes=15),
+            '1h': timedelta(hours=1),
+            '4h': timedelta(hours=4),
+            '1d': timedelta(days=1),
+            '1w': timedelta(weeks=1)
+        }
+        self.command_usage = defaultdict(int)
+
+    def _parse_symbol_arg(self, arg_list: Optional[List[str]]) -> Optional[str]:
+        if not arg_list: # Handles None or empty list
+            return None
+
+        if len(arg_list) == 1:
+            item = str(arg_list[0]).upper() # Ensure string and uppercase
+            if '/' in item:
+                return item  # e.g., "BTC/USDT"
+            else:
+                return item  # e.g., "BTC" (base currency)
+        elif len(arg_list) == 2:
+            # Ensure string and uppercase for both parts
+            return f"{str(arg_list[0]).upper()}/{str(arg_list[1]).upper()}" # e.g., "BTC", "USDT" -> "BTC/USDT"
+        else:
+            # Too many arguments or unhandled case
+            return None
+
+    async def _get_price_and_reply(self, update: Update, context, requested_arg: Optional[str]):
+        try:
+            if not requested_arg:
+                await update.message.reply_text(
+                    "⚠️ من فضلك، أدخل رمز العملة (مثال: /price BTC أو سعر BTC).",
+                    parse_mode='Markdown'
+                )
+                return
+
+            base_currency = ""
+            symbol_usdt = ""
+            symbol_usdc = ""
+            user_facing_symbol_query = requested_arg
+
+            if '/' in requested_arg:
+                parts = requested_arg.split('/')
+                base_currency = parts[0].upper()
+                user_facing_symbol_query = f"{base_currency}/{parts[1].upper()}"
+                if requested_arg.upper().endswith("/USDC"):
+                    symbol_usdc = requested_arg.upper()
+                    symbol_usdt = f"{base_currency}/USDT"
+                else:
+                    symbol_usdt = requested_arg.upper()
+                    symbol_usdc = f"{base_currency}/USDC"
+            else:
+                base_currency = requested_arg.upper()
+                user_facing_symbol_query = base_currency
+                symbol_usdt = f"{base_currency}/USDT"
+                symbol_usdc = f"{base_currency}/USDC"
+
+            # CEX Fetching
+            cex_ticker_data = None
+            fetched_cex_symbol = None
+
+            logger.info(f"Attempting to fetch CEX ticker for {symbol_usdt}")
+            ticker_data_usdt = await self.fetch_current_price(symbol_usdt) # Returns dict or None
+            if ticker_data_usdt:
+                cex_ticker_data = ticker_data_usdt
+                fetched_cex_symbol = symbol_usdt
+            elif symbol_usdc != symbol_usdt:
+                logger.info(f"Failed to fetch {symbol_usdt} from CEX, trying {symbol_usdc}")
+                ticker_data_usdc = await self.fetch_current_price(symbol_usdc)
+                if ticker_data_usdc:
+                    cex_ticker_data = ticker_data_usdc
+                    fetched_cex_symbol = symbol_usdc
+
+            if cex_ticker_data:
+                price = float(cex_ticker_data['last'])
+                percentage_change = cex_ticker_data.get('percentage') # This is usually the 24h change * 100
+
+                change_str = ""
+                if percentage_change is not None:
+                    # CCXT 'percentage' is already in percent, e.g., 1.23 for +1.23%
+                    change_str = f"|{'+' if percentage_change >= 0 else ''}{percentage_change:.2f}%"
+
+                quote_display = fetched_cex_symbol.split('/')[-1]
+
+                # Using base_currency for "Coin Name" part for now
+                # Example: TONCOIN (TON/USDT)
+                # For now, just use the symbol:
+                display_name = fetched_cex_symbol
+
+                reply_message = (
+                    f"**{display_name} (CEX)**\n\n"
+                    f"`{price:.8f} {quote_display.upper()}`      `{change_str}`\n\n" # Using markdown for fixed-width
+                    f"🕒 {datetime.now().strftime('%I:%M:%S %p')}"
+                )
+                await update.message.reply_text(reply_message, parse_mode='Markdown')
+                return
+            else:
+                logger.info(f"No CEX price found for {user_facing_symbol_query}. Attempting DEX search.")
+                dex_pairs = None
+                dex_search_symbol = None
+
+                logger.info(f"Attempting DEX search for {symbol_usdt}")
+                current_dex_pairs_usdt = await self.fetch_dex_price(symbol_usdt)
+                if current_dex_pairs_usdt:
+                    dex_pairs = current_dex_pairs_usdt
+                    dex_search_symbol = symbol_usdt
+                elif symbol_usdc != symbol_usdt:
+                    logger.info(f"DEX search for {symbol_usdt} failed or no pairs, trying {symbol_usdc} on DEX.")
+                    current_dex_pairs_usdc = await self.fetch_dex_price(symbol_usdc)
+                    if current_dex_pairs_usdc:
+                        dex_pairs = current_dex_pairs_usdc
+                        dex_search_symbol = symbol_usdc
+
+                if dex_pairs:
+                    best_dex_pair = dex_pairs[0]
+                    dex_price = best_dex_pair['price']
+                    dex_name = best_dex_pair['dex']
+                    dex_change_24h = best_dex_pair.get('change_24h', 0.0) # Default to 0.0 if missing
+
+                    change_str_dex = f"|{'+' if dex_change_24h >= 0 else ''}{dex_change_24h:.2f}%"
+
+                    # Using base_currency for "Coin Name" part
+                    display_name_dex = dex_search_symbol # e.g. BTC/USDT
+
+                    reply_message_dex = (
+                        f"**{display_name_dex} ({dex_name} - DEX)**\n\n"
+                        f"`{dex_price:.8f} USD`      `{change_str_dex}`\n\n" # DEX price is in USD
+                        f"🕒 {datetime.now().strftime('%I:%M:%S %p')}"
+                    )
+                    await update.message.reply_text(reply_message_dex, parse_mode='Markdown')
+                    return
+                else:
+                    logger.info(f"No DEX price found for {user_facing_symbol_query} (tried USDT/USDC variants).")
+                    await update.message.reply_text(
+                        f"⚠️ تعذر جلب السعر لـ {user_facing_symbol_query}. تأكد من الرمز وحاول مرة أخرى.",
+                        parse_mode='Markdown'
+                    )
+                    return
+
+        except Exception as e:
+            error_msg = f"Unhandled error in _get_price_and_reply for {requested_arg}: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            await update.message.reply_text(
+                "⚠️ حدث خطأ غير متوقع أثناء معالجة طلبك. تم إبلاغ الإدارة.",
+                parse_mode='Markdown'
+            )
+            return
+
+    async def init_exchange(self) -> bool:
+        try:
+            async with asyncio.timeout(10):
+                await self.exchange.load_markets()
+                event_logger.info("تم تحميل أسواق المنصة المركزية بنجاح")
+                await self.send_to_log_group("تم تحميل أسواق المنصة المركزية بنجاح")
+                return True
+        except Exception as e:
+            error_msg = f"خطأ في تحميل أسواق المنصة المركزية: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return False
+
+    async def send_to_log_group(self, message: str):
+        try:
+            if self.application:
+                await self.application.bot.send_message(
+                    chat_id=self.config['log_group_id'],
+                    text=message,
+                    parse_mode='Markdown'
+                )
+        except (BadRequest, Forbidden) as e:
+            logger.error(f"خطأ في إرسال السجل إلى جروب السجلات: {e}")
+
+    async def send_to_error_group(self, message: str):
+        try:
+            if self.application:
+                await self.application.bot.send_message(
+                    chat_id=self.config['error_group_id'],
+                    text=message,
+                    parse_mode='Markdown'
+                )
+        except (BadRequest, Forbidden) as e:
+            logger.error(f"خطأ في إرسال الخطأ إلى جروب الأخطاء: {e}")
+
+    async def check_access(self, update: Update) -> bool:
+        user_id = str(update.effective_user.id)
+        chat_id = str(update.effective_chat.id)
+        is_private = update.effective_chat.type == 'private'
+        is_admin = user_id == self.config['admin_id']
+
+        if is_admin:
+            return True
+
+        allowed, message = self.rate_limiter.check_rate_limit(user_id)
+        if not allowed:
+            await update.message.reply_text(message, parse_mode='Markdown')
+            if "تم حظرك" in message:
+                await self.send_to_error_group(
+                    f"🚫 المستخدم {update.effective_user.first_name} (ID: {user_id}) تم حظره لمدة ساعة بسبب الاستخدام المفرط."
+                )
+            return False
+
+        if is_private and not self.admin_settings['private_enabled']:
+            await update.message.reply_text(
+                "⚠️ الإدارة قفلت استخدام البوت في الدردشة الخاصة حاليًا.\n📌 حاول لاحقًا أو تواصل مع الأدمن.",
+                parse_mode='Markdown'
+            )
+            return False
+
+        if not is_private and chat_id != self.admin_settings['active_group_id']:
+            return False
+
+        if message:
+            await update.message.reply_text(message, parse_mode='Markdown')
+
+        return True
+
+    async def admin_panel(self, update: Update, context):
+        if str(update.effective_user.id) != self.config['admin_id']:
+            await update.message.reply_text("⚠️ هذا الأمر متاح للأدمن فقط!", parse_mode='Markdown')
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"{'إيقاف' if self.admin_settings['private_enabled'] else 'تفعيل'} الدردشة الخاصة",
+                    callback_data='toggle_private'
+                )
+            ],
+            [
+                InlineKeyboardButton("تعيين مجموعة", callback_data='set_group')
+            ],
+            [
+                InlineKeyboardButton("إعادة تشغيل البوت", callback_data='restart_bot'),
+                InlineKeyboardButton("إحصائيات الاستخدام", callback_data='usage_stats')
+            ],
+            [
+                InlineKeyboardButton("إغلاق اللوحة", callback_data='close_panel')
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "🛠️ **لوحة تحكم الأدمن** 🛠️\nاختر إعدادًا لتخصيصه:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def handle_admin_callback(self, update: Update, context):
+        query = update.callback_query
+        await query.answer()
+        if str(query.from_user.id) != self.config['admin_id']:
+            await query.message.reply_text("⚠️ هذا الأمر متاح للأدمن فقط!", parse_mode='Markdown')
+            return
+
+        data = query.data
+        if data == 'toggle_private':
+            self.admin_settings['private_enabled'] = not self.admin_settings['private_enabled']
+            status = "مفعلة" if self.admin_settings['private_enabled'] else "مقفلة"
+            await query.message.edit_text(
+                f"✅ تم {'تفعيل' if self.admin_settings['private_enabled'] else 'إيقاف'} الدردشة الخاصة.\nالحالة الحالية: {status}",
+                parse_mode='Markdown'
+                )
+            await self.send_to_log_group(f"تم {'تفعيل' if self.admin_settings['private_enabled'] else 'إيقاف'} الدردشة الخاصة من قبل الأدمن.")
+        elif data == 'set_group':
+            self.waiting_for_group_id = True
+            await query.message.edit_text(
+                "📌 من فضلك، أرسل ID المجموعة (مثال: -1001234567890) لتفعيل البوت فيها.",
+                parse_mode='Markdown'
+            )
+        elif data == 'restart_bot':
+            await query.message.edit_text("🔄 جاري إعادة تشغيل البوت...", parse_mode='Markdown')
+            await self.send_to_log_group("تم إعادة تشغيل البوت من قبل الأدمن.")
+            os._exit(0)
+        elif data == 'usage_stats':
+            stats = "\n".join([f"{cmd}: {count} مرة" for cmd, count in self.command_usage.items()])
+            await query.message.edit_text(
+                f"📊 **إحصائيات الاستخدام**:\n{stats if stats else 'لا توجد بيانات استخدام بعد.'}",
+                parse_mode='Markdown'
+            )
+        elif data == 'close_panel':
+            await query.message.delete()
+
+    async def handle_group_id(self, update: Update, context):
+        if not self.waiting_for_group_id or str(update.effective_user.id) != self.config['admin_id']:
+            return
+
+        group_id = update.message.text.strip()
+        try:
+            chat = await context.bot.get_chat(group_id)
+            self.admin_settings['active_group_id'] = group_id
+            self.admin_settings['active_group_name'] = chat.title
+            self.waiting_for_group_id = False
+            await update.message.reply_text(
+                f"✅ تم تعيين المجموعة **{chat.title}** (ID: {group_id}) بنجاح!",
+                parse_mode='Markdown'
+            )
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=(
+                    f"🎉 **تم تفعيل البوت في مجموعة {chat.title}** من قبل {update.effective_user.first_name}! 🚀\n"
+                    "📋 استخدم `/help` أو "مساعدة" لعرض الأوامر المتاحة.\n"
+                    "💡 جاهز لخدمتكم في تحليل الأسعار والتداول!"
+                ),
+                parse_mode='Markdown'
+            )
+            await self.send_to_log_group(f"تم تفعيل البوت في المجموعة {chat.title} (ID: {group_id}) من قبل الأدمن.")
+        except Exception as e:
+            await update.message.reply_text(
+                f"⚠️ خطأ في تعيين المجموعة: {e}\n📌 تأكد من إدخال ID صحيح وأن البوت عضو في المجموعة.",
+                parse_mode='Markdown'
+            )
+            await self.send_to_error_group(f"خطأ في تعيين المجموعة {group_id}: {e}")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 500) -> Optional[pd.DataFrame]:
+        try:
+            async with asyncio.timeout(10):
+                cache_key = f"{symbol}:{timeframe}"
+                if cache_key in self.cached_data:
+                    cached, timestamp = self.cached_data[cache_key]
+                    if (datetime.now().timestamp() - timestamp) < 300:
+                        return cached
+                if not await self.init_exchange():
+                    raise RuntimeError("فشل تهيئة المنصة المركزية")
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                if not ohlcv or len(ohlcv) < 50:
+                    raise ValueError(f"بيانات غير كافية لـ {symbol} على {timeframe}: {len(ohlcv)} صفوف")
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df = df.interpolate(method='linear').ffill().bfill()
+                df = self.calculate_indicators(df)
+                if df is None or len(df) < 50:
+                    raise ValueError(f"فشل معالجة البيانات لـ {symbol} على {timeframe}")
+                self.cached_data[cache_key] = (df, datetime.now().timestamp())
+                event_logger.info(f"تم جلب {len(df)} شمعة لـ {symbol} على {timeframe}")
+                await self.send_to_log_group(f"تم جلب {len(df)} شمعة لـ {symbol} على {timeframe}")
+                return df
+        except Exception as e:
+            error_msg = f"خطأ في جلب بيانات {symbol} على {timeframe}: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    async def fetch_current_price(self, symbol: str) -> Optional[Dict]:
+        try:
+            async with asyncio.timeout(10):
+                ticker = await self.exchange.fetch_ticker(symbol)
+                return ticker # Changed to return full ticker
+        except ccxt.SymbolNotFound:
+            logger.info(f"Symbol {symbol} not found on CEX via fetch_current_price.")
+            return None
+        except Exception as e:
+            error_msg = f"خطأ في جلب السعر الحالي لـ {symbol}: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+    async def fetch_dex_price(self, symbol: str) -> Optional[List[Dict]]:
+        try:
+            async with asyncio.timeout(10):
+                base, quote = symbol.split('/')
+                url = f"https://api.dexscreener.com/latest/dex/search?q={base}"
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                pairs = []
+                for pair in data.get('pairs', []):
+                    if pair['quoteToken']['symbol'].upper() == quote.upper():
+                        pairs.append({
+                            'price': float(pair['priceUsd']),
+                            'dex': pair['dexId'],
+                            'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                            'volume': float(pair.get('volume', {}).get('h24', 0)),
+                            'change_24h': float(pair.get('priceChange', {}).get('h24', 0)) # Added this line
+                        })
+                return pairs if pairs else None
+        except Exception as e:
+            error_msg = f"خطأ في جلب سعر {symbol} من DEX: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return None
+
+    async def fetch_available_pairs(self, search_term: str) -> Optional[Dict[str, List]]:
+        try:
+            async with asyncio.timeout(10):
+                if not await self.init_exchange():
+                    raise RuntimeError("فشل تهيئة المنصة المركزية")
+                markets = self.exchange.markets
+                search_term = search_term.upper()
+                cex_pairs = []
+                for pair in markets.keys(): # Iterating through available CEX pairs
+                    base = pair.split('/')[0]
+                    if search_term in base:
+                        # fetch_current_price now returns a ticker dict or None
+                        ticker_data = await self.fetch_current_price(pair)
+                        if ticker_data:
+                            cex_pairs.append({
+                                'pair': pair,
+                                'price': float(ticker_data['last']),
+                                'volume': float(ticker_data.get('quoteVolume', 0)) # Using quoteVolume for CEX volume
+                            })
+
+                url = f"https://api.dexscreener.com/latest/dex/search?q={search_term}"
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                dex_pairs = [
+                    {
+                        'pair': f"{pair['baseToken']['symbol']}/{pair['quoteToken']['symbol']}",
+                        'dex': pair['dexId'],
+                        'price': float(pair['priceUsd']),
+                        'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+                        'volume': float(pair.get('volume', {}).get('h24', 0))
+                    }
+                    for pair in data.get('pairs', []) if search_term in pair['baseToken']['symbol'].upper()
+                ]
+
+                result = {'cex': cex_pairs, 'dex': dex_pairs}
+                event_logger.info(f"تم البحث عن أزواج لـ {search_term}")
+                await self.send_to_log_group(f"تم البحث عن أزواج لـ {search_term}")
+                return result if cex_pairs or dex_pairs else None
+        except Exception as e:
+            error_msg = f"خطأ في جلب أزواج التداول لـ {search_term}: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return None
+
+    def calculate_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        try:
+            if len(df) < 50:
+                raise ValueError(f"بيانات غير كافية: {len(df)}")
+            missing_indicators = []
+
+            for indicator in self.features:
+                try:
+                    if indicator == 'RSI_14':
+                        df['RSI_14'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+                    elif indicator == 'RSI_7':
+                        df['RSI_7'] = ta.momentum.RSIIndicator(df['close'], window=7).rsi()
+                    elif indicator == 'RSI_21':
+                        df['RSI_21'] = ta.momentum.RSIIndicator(df['close'], window=21).rsi()
+                    elif indicator == 'MACD':
+                        df['MACD'] = ta.trend.MACD(df['close']).macd()
+                    elif indicator == 'MACD_signal':
+                        df['MACD_signal'] = ta.trend.MACD(df['close']).macd_signal()
+                    elif indicator == 'Bollinger_width':
+                        df['Bollinger_width'] = ta.volatility.BollingerBands(df['close']).bollinger_wband()
+                    elif indicator == 'ATR_14':
+                        df['ATR_14'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+                    elif indicator == 'ATR_7':
+                        df['ATR_7'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=7).average_true_range()
+                    elif indicator == 'Stochastic':
+                        df['Stochastic'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+                    elif indicator == 'Volume_MA_20':
+                        df['Volume_MA_20'] = ta.trend.SMAIndicator(df['volume'], window=20).sma_indicator()
+                    elif indicator == 'Volume_MA_50':
+                        df['Volume_MA_50'] = ta.trend.SMAIndicator(df['volume'], window=50).sma_indicator()
+                    elif indicator == 'Ichimoku_tenkan':
+                        df['Ichimoku_tenkan'] = ta.trend.IchimokuIndicator(df['high'], df['low']).ichimoku_conversion_line()
+                    elif indicator == 'Ichimoku_kijun':
+                        df['Ichimoku_kijun'] = ta.trend.IchimokuIndicator(df['high'], df['low']).ichimoku_base_line()
+                    elif indicator == 'Ichimoku_senkou_a':
+                        df['Ichimoku_senkou_a'] = ta.trend.IchimokuIndicator(df['high'], df['low']).ichimoku_a()
+                    elif indicator == 'Ichimoku_senkou_b':
+                        df['Ichimoku_senkou_b'] = ta.trend.IchimokuIndicator(df['high'], df['low']).ichimoku_b()
+                    elif indicator == 'ADX':
+                        df['ADX'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx()
+                    elif indicator == 'Parabolic_SAR':
+                        df['Parabolic_SAR'] = ta.trend.PSARIndicator(df['high'], df['low'], df['close']).psar()
+                    elif indicator == 'CCI':
+                        df['CCI'] = ta.trend.CCIIndicator(df['high'], df['low'], df['close']).cci()
+                    elif indicator == 'MFI':
+                        df['MFI'] = ta.momentum.MoneyFlowIndexIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
+                    elif indicator == 'Williams_R':
+                        df['Williams_R'] = ta.momentum.WilliamsRIndicator(df['high'], df['low'], df['close']).williams_r()
+                    elif indicator == 'ROC':
+                        df['ROC'] = ta.momentum.ROCIndicator(df['close']).roc()
+                    elif indicator == 'CMO':
+                        df['CMO'] = ta.momentum.CMOIndicator(df['close']).cmo()
+                    elif indicator == 'KAMA':
+                        df['KAMA'] = ta.trend.KAMAIndicator(df['close']).kama()
+                    elif indicator == 'PPO':
+                        df['PPO'] = ta.trend.PPOIndicator(df['close']).ppo()
+                    elif indicator == 'TRIX':
+                        df['TRIX'] = ta.trend.TRIXIndicator(df['close']).trix()
+                    elif indicator == 'DMI_plus':
+                        df['DMI_plus'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx_pos()
+                    elif indicator == 'DMI_minus':
+                        df['DMI_minus'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx_neg()
+                    elif indicator.startswith('MA_'):
+                        period = int(indicator.split('_')[1])
+                        df[f'MA_{period}'] = ta.trend.SMAIndicator(df['close'], window=period).sma_indicator()
+                    elif indicator.startswith('EMA_'):
+                        period = int(indicator.split('_')[1])
+                        df[f'EMA_{period}'] = ta.trend.EMAIndicator(df['close'], window=period).ema_indicator()
+                    elif indicator == 'OBV':
+                        df['OBV'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
+                    elif indicator == 'Chaikin_AD':
+                        df['Chaikin_AD'] = ta.volume.ChaikinADIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_ad()
+                    elif indicator == 'Force_Index':
+                        df['Force_Index'] = ta.volume.ForceIndexIndicator(df['close'], df['volume']).force_index()
+                    elif indicator == 'Elder_Ray_Bull':
+                        df['Elder_Ray_Bull'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator() - df['close']
+                    elif indicator == 'Elder_Ray_Bear':
+                        df['Elder_Ray_Bear'] = df['close'] - ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
+                    elif indicator == 'VWAP':
+                        df['VWAP'] = ta.volume.VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['volume']).volume_weighted_average_price()
+                    elif indicator == 'Keltner_Channel':
+                        df['Keltner_Channel'] = ta.volatility.KeltnerChannel(df['high'], df['low'], df['close']).keltner_channel_mband()
+                    elif indicator == 'Donchian_Channel':
+                        df['Donchian_Channel'] = ta.volatility.DonchianChannel(df['high'], df['low'], df['close']).donchian_channel_mband()
+                    elif indicator == 'Aroon_Up':
+                        df['Aroon_Up'] = ta.trend.AroonIndicator(df['close']).aroon_up()
+                    elif indicator == 'Aroon_Down':
+                        df['Aroon_Down'] = ta.trend.AroonIndicator(df['close']).aroon_down()
+                    elif indicator == 'Ulcer_Index':
+                        df['Ulcer_Index'] = ta.volatility.UlcerIndex(df['close']).ulcer_index()
+                    elif indicator == 'Chande_Momentum':
+                        df['Chande_Momentum'] = ta.momentum.CMOIndicator(df['close']).cmo()
+                    elif indicator == 'Stoch_RSI':
+                        df['Stoch_RSI'] = ta.momentum.StochRSIIndicator(df['close']).stochrsi()
+                    elif indicator == 'Ultimate_Oscillator':
+                        df['Ultimate_Oscillator'] = ta.momentum.AwesomeOscillatorIndicator(df['high'], df['low']).awesome_oscillator()
+                except Exception as e:
+                    missing_indicators.append(indicator)
+                    df[indicator] = np.nan
+                    logger.warning(f"فشل حساب المؤشر {indicator}: {e}")
+
+            df['Support'] = df['low'].rolling(window=20).min()
+            df['Resistance'] = df['high'].rolling(window=20).max()
+
+            df = self.detect_candlestick_patterns(df)
+            df = self.detect_price_patterns(df)
+
+            df = df.dropna(subset=['close', 'Support', 'Resistance'])
+            if missing_indicators:
+                error_msg = f"المؤشرات غير المتوفرة: {', '.join(missing_indicators)}"
+                asyncio.create_task(self.send_to_error_group(error_msg))
+                event_logger.info(error_msg)
+            event_logger.info(f"تم حساب المؤشرات لـ {len(df)} صف")
+            asyncio.create_task(self.send_to_log_group(f"تم حساب المؤشرات لـ {len(df)} صف"))
+            return df
+        except Exception as e:
+            error_msg = f"خطأ في حساب المؤشرات: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            asyncio.create_task(self.send_to_error_group(error_msg))
+            return None
+
+    def detect_candlestick_patterns(self, df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            df['Engulfing_Bullish'] = (
+                (df['close'].shift(1) < df['open'].shift(1)) &
+                (df['close'] > df['open'].shift(1)) &
+                (df['open'] < df['close'].shift(1)) &
+                (df['close'] > df['open'])
+            ).astype(int)
+            df['Engulfing_Bearish'] = (
+                (df['close'].shift(1) > df['open'].shift(1)) &
+                (df['close'] < df['open'].shift(1)) &
+                (df['open'] > df['close'].shift(1)) &
+                (df['close'] < df['open'])
+            ).astype(int)
+            df['Hammer'] = (
+                (df['close'] > df['open']) &
+                ((df['high'] - df['low']) > 3 * (df['close'] - df['open'])) &
+                ((df['close'] - df['low']) / (df['high'] - df['low']) < 0.3)
+            ).astype(int)
+            df['Shooting_Star'] = (
+                (df['close'] < df['open']) &
+                ((df['high'] - df['low']) > 3 * (df['open'] - df['close'])) &
+                ((df['high'] - df['close']) / (df['high'] - df['low']) > 0.7)
+            ).astype(int)
+            df['Doji'] = (
+                (abs(df['close'] - df['open']) / (df['high'] - df['low']) < 0.1) &
+                ((df['high'] - df['low']) > 0)
+            ).astype(int)
+            df['Morning_Star'] = (
+                (df['close'].shift(2) < df['open'].shift(2)) &
+                (abs(df['close'].shift(1) - df['open'].shift(1)) / (df['high'].shift(1) - df['low'].shift(1)) < 0.1) &
+                (df['close'] > df['open']) &
+                (df['close'] > df['close'].shift(2))
+            ).astype(int)
+            df['Evening_Star'] = (
+                (df['close'].shift(2) > df['open'].shift(2)) &
+                (abs(df['close'].shift(1) - df['open'].shift(1)) / (df['high'].shift(1) - df['low'].shift(1)) < 0.1) &
+                (df['close'] < df['open']) &
+                (df['close'] < df['close'].shift(2))
+            ).astype(int)
+            return df
+        except Exception as e:
+            error_msg = f"خطأ في اكتشاف نماذج الشموع: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            asyncio.create_task(self.send_to_error_group(error_msg))
+            return df
+
+    def detect_price_patterns(self, df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            df['Double_Top'] = (
+                (df['high'].rolling(window=20).max() == df['high']) &
+                (df['high'].shift(10).rolling(window=20).max() == df['high'].shift(10)) &
+                (df['high'] == df['high'].shift(10))
+            ).astype(int)
+            df['Double_Bottom'] = (
+                (df['low'].rolling(window=20).min() == df['low']) &
+                (df['low'].shift(10).rolling(window=20).min() == df['low'].shift(10)) &
+                (df['low'] == df['low'].shift(10))
+            ).astype(int)
+            df['Head_Shoulders'] = (
+                (df['high'].shift(10) > df['high'].shift(20)) &
+                (df['high'].shift(10) > df['high']) &
+                (df['low'].shift(15) < df['low'].shift(25)) &
+                (df['low'].shift(15) < df['low'].shift(5))
+            ).astype(int)
+            df['Triangle_Ascending'] = (
+                (df['high'].rolling(window=20).max() == df['high'].shift(10)) &
+                (df['low'].rolling(window=20).min() < df['low'].shift(10).rolling(window=20).min())
+            ).astype(int)
+            df['Triangle_Descending'] = (
+                (df['low'].rolling(window=20).min() == df['low'].shift(10)) &
+                (df['high'].rolling(window=20).max() > df['high'].shift(10).rolling(window=20).max())
+            ).astype(int)
+            df['Flag'] = (
+                (df['high'].rolling(window=10).max() - df['low'].rolling(window=10).min()) < df['ATR_14'] * 2
+            ).astype(int)
+            df['Supply_Demand_Zone'] = (
+                (df['volume'] > df['Volume_MA_20'] * 1.3) &
+                ((df['high'] - df['low']) > df['ATR_14'] * 2)
+            ).astype(int)
+            df['Liquidity_Grab'] = (
+                (df['high'] > df['Resistance'].shift(1)) &
+                (df['volume'] > df['Volume_MA_20'] * 1.5)
+            ).astype(int)
+            return df
+        except Exception as e:
+            error_msg = f"خطأ في اكتشاف نماذج الأسعار: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            asyncio.create_task(self.send_to_error_group(error_msg))
+            return df
+
+    async def predict_price(self, df: pd.DataFrame, symbol: str, time_horizon: int) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[float], Optional[Dict], Optional[float], Optional[List[str]]]:
+        try:
+            latest = df.iloc[-1]
+            # fetch_current_price now returns a dictionary
+            ticker_data = await self.fetch_current_price(symbol)
+            if ticker_data is None:
+                raise RuntimeError("فشل جلب السعر الحالي")
+            current_price = float(ticker_data['last']) # Extract price from ticker
+
+            X = df[self.features][-500:].fillna(0)
+            y = df['close'].pct_change().shift(-1)[-500:].fillna(0)
+            mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+            X = X[mask]
+            y = y[mask]
+            if len(X) < 20:
+                raise ValueError("بيانات غير كافية لنموذج التعلم الآلي")
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+            model.fit(X_scaled[:-1], y[:-1])
+            latest_features = scaler.transform([df[self.features].iloc[-1].fillna(0).values])
+            predicted_change = model.predict(latest_features)[0]
+            predicted_price = current_price * (1 + predicted_change * time_horizon)
+            decimal_places = 8 if current_price < 0.01 else 2
+            predicted_price = round(predicted_price, decimal_places)
+            current_price = round(current_price, decimal_places)
+            trend = 'صعودي' if predicted_price > current_price else 'هبوطي'
+            price_change = predicted_price - current_price
+            raw_score = model.score(X_scaled[:-1], y[:-1])
+            confidence = max(0, raw_score * 100) # Scale R^2 to 0-100, floor at 0
+            confidence = min(confidence, 95) # Still cap at 95 to avoid overconfidence display issues
+            atr = latest['ATR_14'] if not np.isnan(latest['ATR_14']) else (latest['ATR_7'] if not np.isnan(latest['ATR_7']) else (df['high'] - df['low']).mean())
+            support = latest['Support']
+            resistance = latest['Resistance']
+            futures_recommendation = {
+                'entry': current_price,
+                'take_profit': round(resistance, decimal_places) if trend == 'صعودي' else round(support, decimal_places),
+                'stop_loss': round(support - atr, decimal_places) if trend == 'صعودي' else round(resistance + atr, decimal_places)
+            }
+            reasons = self.generate_signal_reasons(df, trend)
+            return current_price, predicted_price, trend, price_change, futures_recommendation, confidence, reasons
+        except Exception as e:
+            error_msg = f"خطأ في توقع السعر لـ {symbol}: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            await self.send_to_error_group(error_msg)
+            return None, None, None, None, None, None, []
+
+    def estimate_time_to_target(self, df: pd.DataFrame, current_price: float, target_price: float, timeframe: str) -> str:
+        try:
+            latest = df.iloc[-1]
+            atr = latest.get('ATR_14', latest.get('ATR_7', 0))
+            if atr == 0:
+                atr = (df['high'] - df['low']).mean()  # احتياطي إذا كان ATR غير متوفر
+            volume_factor = latest['volume'] / latest['Volume_MA_20'] if not np.isnan(latest.get('Volume_MA_20')) else 1
+
+            # حساب معدل التغير في السعر (Price Velocity) بناءً على آخر 10 شموع
+            recent_data = df.tail(10)
+            price_changes = recent_data['close'].pct_change().abs()
+            avg_price_change_per_candle = price_changes.mean()  # متوسط التغير لكل شمعة
+            if avg_price_change_per_candle == 0 or np.isnan(avg_price_change_per_candle):
+                avg_price_change_per_candle = 0.001  # قيمة افتراضية صغيرة لتجنب القسمة على صفر
+
+            # حساب المسافة السعرية المطلوبة كنسبة
+            price_diff = abs(target_price - current_price) / current_price
+
+            # تقدير عدد الشموع اللازمة بناءً على معدل التغير وATR
+            candles_needed = price_diff / (avg_price_change_per_candle * max(0.5, min(2, volume_factor)))
+            candles_needed = max(1, min(100, candles_needed))  # تحديد النطاق بين 1 و100 شمعة
+
+            # تحويل عدد الشموع إلى وقت بناءً على الإطار الزمني
+            timeframe_duration = self.timeframe_durations.get(timeframe, timedelta(minutes=15))
+            estimated_time = timeframe_duration * candles_needed
+
+            # تحويل الوقت إلى نص ديناميكي
+            total_seconds = estimated_time.total_seconds()
+            if total_seconds < 60:
+                return f"في خلال {int(total_seconds)} ثانية"
+            elif total_seconds < 3600:
+                minutes = int(total_seconds / 60)
+                seconds = int(total_seconds % 60)
+                return f"في خلال {minutes} دقيقة و{seconds} ثانية"
+            elif total_seconds < 86400:
+                hours = int(total_seconds / 3600)
+                minutes = int((total_seconds % 3600) / 60)
+                return f"في خلال {hours} ساعة و{minutes} دقيقة"
+            else:
+                days = int(total_seconds / 86400)
+                hours = int((total_seconds % 86400) / 3600)
+                return f"في خلال {days} يوم و{hours} ساعة"
+        except Exception as e:
+            error_msg = f"خطأ في تقدير الوقت للوصول إلى الهدف: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            asyncio.create_task(self.send_to_error_group(error_msg))
+            return "في خلال ساعة"
+
+    def generate_signal_reasons(self, df: pd.DataFrame, trend: str) -> List[str]:
+        try:
+            latest = df.iloc[-1]
+            reasons = []
+            if latest.get('Engulfing_Bullish', 0) == 1 and trend == 'صعودي':
+                reasons.append("نموذج شمعة Engulfing صعودي")
+            if latest.get('Engulfing_Bearish', 0) == 1 and trend == 'هبوطي':
+                reasons.append("نموذج شمعة Engulfing هبوطي")
+            if latest.get('Hammer', 0) == 1 and trend == 'صعودي':
+                reasons.append("نموذج شمعة Hammer")
+            if latest.get('Shooting_Star', 0) == 1 and trend == 'هبوطي':
+                reasons.append("نموذج شمعة Shooting Star")
+            if latest.get('Morning_Star', 0) == 1 and trend == 'صعودي':
+                reasons.append("نموذج Morning Star صعودي")
+            if latest.get('Evening_Star', 0) == 1 and trend == 'هبوطي':
+                reasons.append("نموذج Evening Star هبوطي")
+            if latest.get('RSI_14', 50) < 30 and trend == 'صعودي':
+                reasons.append("RSI يظهر إشارة تشبع بيع")
+            if latest.get('RSI_14', 50) > 70 and trend == 'هبوطي':
+                reasons.append("RSI يظهر إشارة تشبع شراء")
+            if latest.get('MACD', 0) > latest.get('MACD_signal', 0) and trend == 'صعودي':
+                reasons.append("تقاطع MACD صعودي")
+            if latest.get('MACD', 0) < latest.get('MACD_signal', 0) and trend == 'هبوطي':
+                reasons.append("تقاطع MACD هبوطي")
+            if latest.get('Volume_MA_20', 0) and latest['volume'] > latest['Volume_MA_20'] * 1.3:
+                reasons.append(f"حجم تداول مرتفع (+{round((latest['volume'] / latest['Volume_MA_20'] - 1) * 100)}% عن المتوسط)")
+            if latest.get('Liquidity_Grab', 0) == 1:
+                reasons.append("إشارة Liquidity Grab")
+            return reasons
+        except Exception as e:
+            error_msg = f"خطأ في إنشاء أسباب الإشارة: {e}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            asyncio.create_task(self.send_to_error_group(error_msg))
+            return []
+
+    async def start(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['start'] += 1
+        group_name = self.admin_settings['active_group_name'] or "غير محددة"
+        await update.message.reply_text(
+            f"👋 **مرحبًا بك في بوت التداول!** 🚀\n"
+            f"📈 أنا هنا عشان أساعدك في تحليل الأسعار، توقعات السوق، وفرص التداول.\n"
+            f"📍 البوت مفعل في المجموعة: **{group_name}**\n"
+            f"📋 استخدم `/help` أو اكتب "مساعدة" لعرض الأوامر المتاحة.\n"
+            f"💡 جاهز لخدمتك!",
+            parse_mode='Markdown'
+        )
+
+    async def help(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['help'] += 1
+        await update.message.reply_text(
+            "📋 **قائمة الأوامر المتاحة**:\n"
+            "🔍 `/start` - بدء التفاعل مع البوت\n"
+            "📈 `/price <رمز>` - عرض السعر الحالي لزوج تداول (مثال: BTC/USDT)\n"
+            "🔎 `/search <رمز>` - البحث عن أزواج تداول (مثال: BTC)\n"
+            "🎯 `/deal <رمز> <نسبة>` - طلب إشعار صفقة بنسبة ربح معينة\n"
+            "📊 `/chart <رمز>` - عرض رسم بياني لزوج تداول\n"
+            "🔮 `/predict <رمز>` - توقع حركة السعر (1m, 5m, 1h)\n"
+            "🛠️ `/admin` - لوحة تحكم الأدمن (للأدمن فقط)\n"
+            "🟢 `/running` أو "حالة" - التحقق من حالة البوت\n"
+            "💡 اكتب الأوامر بالإنجليزية أو العربية (مثل "مساعدة" بدل `/help`)",
+            parse_mode='Markdown'
+        )
+
+    async def price(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['price'] += 1 # Existing usage counter
+
+        # Use the new helper to parse arguments
+        parsed_arg = self._parse_symbol_arg(context.args)
+
+        # Call the new core logic method
+        await self._get_price_and_reply(update, context, parsed_arg)
+
+    async def search(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['search'] += 1
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ من فضلك، أدخل رمزًا للبحث (مثال: /search BTC)",
+                parse_mode='Markdown'
+                )
+            return
+        search_term = context.args[0].upper()
+        pairs = await self.fetch_available_pairs(search_term) # This method already logs/sends errors
+
+        if pairs:
+            response = f"🔎 **نتائج البحث عن {search_term}**:\n\n"
+
+            response += "**منصات مركزية (CEX)**:\n"
+            if not pairs.get('cex'): # Use .get() for safety
+                response += "- لا توجد نتائج.\n"
+            else:
+                for pair_data in pairs['cex'][:5]:
+                    price_str = f"{pair_data.get('price', 0):.4f}" # Use .get() and provide default
+                    volume_val = pair_data.get('volume', 0) # Get volume, default to 0
+                    # In fetch_available_pairs, 'volume' for CEX was markets[pair].get('info', {}).get('volume', 0)
+                    # This is likely base currency volume. For display, quote currency volume is often preferred.
+                    # CCXT ticker objects often have 'quoteVolume'. Let's assume 'volume' here is quoteVolume or a suitable proxy.
+                    volume_str = f"{volume_val:,.2f}" if volume_val else "N/A"
+                    response += f"- `{pair_data['pair']}`: *{price_str} USDT* (حجم: {volume_str})\n"
+
+            response += "\n**منصات لامركزية (DEX)**:\n"
+            if not pairs.get('dex'): # Use .get() for safety
+                response += "- لا توجد نتائج.\n"
+            else:
+                for pair_data in pairs['dex'][:5]:
+                    price_str = f"{pair_data.get('price', 0):.4f}"
+                    liquidity_val = pair_data.get('liquidity', 0)
+                    liquidity_str = f"{liquidity_val:,.2f}" if liquidity_val else "N/A"
+                    volume_val_dex = pair_data.get('volume', 0)
+                    volume_str_dex = f"{volume_val_dex:,.2f}" if volume_val_dex else "N/A"
+                    response += f"- `{pair_data['pair']}` ({pair_data['dex']}): *{price_str} USD*\n"
+                    response += f"  (سيولة: {liquidity_str} USD, حجم 24س: {volume_str_dex} USD)\n"
+
+            await update.message.reply_text(response, parse_mode='Markdown')
+        else:
+            # This case implies fetch_available_pairs returned None or an empty dict overall
+            await update.message.reply_text(
+                f"⚠️ لم يتم العثور على أي أزواج تداول لـ {search_term} أو حدث خطأ.",
+                parse_mode='Markdown'
+            )
+
+    async def deal(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['deal'] += 1
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "⚠️ استخدام الأمر: /deal <رمز> <نسبة الربح>\n"
+                "مثال: /deal BTC/USDT 10",
+                parse_mode='Markdown'
+            )
+            return
+        symbol = context.args[0].upper()
+        try:
+            target_percentage = float(context.args[1])
+            if target_percentage <= 0:
+                raise ValueError("نسبة الربح يجب أن تكون أكبر من 0")
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ نسبة الربح يجب أن تكون رقمًا (مثل 10.5 لـ 10.5%)",
+                parse_mode='Markdown'
+            )
+            return
+
+        timeframes = ['15m', '1h', '4h', '1d'] # Changed timeframes
+        best_confidence = 0
+        best_result = None
+        best_timeframe = None
+
+        for timeframe in timeframes:
+            df = await self.fetch_ohlcv(symbol, timeframe)
+            if df is None:
+                continue
+            # Changed time_horizon from 1 to 3
+            current_price, predicted_price, trend, _, futures, confidence, reasons = await self.predict_price(df, symbol, 3)
+            if current_price is None or confidence < 50: # Changed confidence threshold to 50
+                continue
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_result = (current_price, predicted_price, trend, futures, reasons)
+                best_timeframe = timeframe
+
+        if best_result is None:
+            await update.message.reply_text(
+                f"⚠️ لا توجد فرصة صفقة موثوقة لـ {symbol} حاليًا. حاول لاحقًا.",
+                parse_mode='Markdown'
+            )
+            return
+
+        current_price, predicted_price, trend, futures, reasons = best_result
+        target_price = current_price * (1 + target_percentage / 100) if trend == 'صعودي' else current_price * (1 - target_percentage / 100)
+        estimated_time = self.estimate_time_to_target(df, current_price, target_price, best_timeframe)
+
+        response = (
+            f"🔔 **فرصة صفقة على {symbol}** 🔔\n"
+            f"💰 **سعر الدخول**: {current_price:.2f} USDT\n"
+            f"🎯 **الهدف ({target_percentage:.1f}%)**: {target_price:.2f} USDT\n"
+            f"⏰ **الوقت المتوقع**: {estimated_time}\n"
+            f"🎯 **هدف إضافي 1 ({target_percentage + 2:.1f}%)**: {(current_price * (1 + (target_percentage + 2) / 100)):.2f} USDT\n"
+            f"🎯 **هدف إضافي 2 ({target_percentage + 5:.1f}%)**: {(current_price * (1 + (target_percentage + 5) / 100)):.2f} USDT\n"
+            f"⛔ **إيقاف الخسارة**: {futures['stop_loss']:.2f} USDT\n"
+            f"📊 **السبب**:\n"
+        )
+        for reason in reasons:
+            response += f"- {reason}\n"
+        response += (
+            f"📈 **نسبة الثقة**: {'█' * int(best_confidence // 10)}{' ' * (10 - int(best_confidence // 10))} {best_confidence:.1f}%\n"
+            f"🕒 الوقت: {datetime.now().strftime('%I:%M %p EEST')}\n"
+            f"💡 **التوصية**: {'اشتري' if trend == 'صعودي' else 'بيع'} الآن!"
+        )
+
+        await update.message.reply_text(response, parse_mode='Markdown')
+        await self.send_to_log_group(f"تم إنشاء إشعار صفقة لـ {symbol} بنسبة {target_percentage}% من المستخدم {update.effective_user.first_name}")
+
+    async def chart(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['chart'] += 1
+        symbol = context.args[0].upper() if context.args else self.config['default_symbol']
+        df = await self.fetch_ohlcv(symbol, '15m')
+        if df is None:
+            await update.message.reply_text(
+                f"⚠️ تعذر جلب البيانات لـ {symbol}. حاول مرة أخرى.",
+                parse_mode='Markdown'
+            )
+            return
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(df['timestamp'], df['close'], label='Close Price')
+        plt.title(f'{symbol} Price Chart (15m)')
+        plt.xlabel('Time')
+        plt.ylabel('Price (USDT)')
+        plt.legend()
+        plt.grid()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+
+        keyboard = [
+            [
+                InlineKeyboardButton("1m", callback_data=f"chart:{symbol}:1m"),
+                InlineKeyboardButton("5m", callback_data=f"chart:{symbol}:5m"),
+                InlineKeyboardButton("10m", callback_data=f"chart:{symbol}:10m")
+            ],
+            [
+                InlineKeyboardButton("1h", callback_data=f"chart:{symbol}:1h"),
+                InlineKeyboardButton("1w", callback_data=f"chart:{symbol}:1w")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_photo(
+            photo=buf,
+            caption=f"📊 **رسم بياني لـ {symbol} (15m)**\nاختر إطارًا زمنيًا آخر:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+
+    async def handle_chart_callback(self, update: Update, context):
+        query = update.callback_query
+        await query.answer()
+        if not await self.check_access(update):
+            await query.message.delete()
+            return
+        data = query.data.split(':')
+        if len(data) != 3 or data[0] != 'chart':
+            return
+        symbol, timeframe = data[1], data[2]
+        df = await self.fetch_ohlcv(symbol, timeframe)
+        if df is None:
+            await query.message.reply_text(
+                f"⚠️ تعذر جلب البيانات لـ {symbol} على {timeframe}.",
+                parse_mode='Markdown'
+            )
+            return
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(df['timestamp'], df['close'], label='Close Price')
+        plt.title(f'{symbol} Price Chart ({timeframe})')
+        plt.xlabel('Time')
+        plt.ylabel('Price (USDT)')
+        plt.legend()
+        plt.grid()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+
+        keyboard = [
+            [
+                InlineKeyboardButton("1m", callback_data=f"chart:{symbol}:1m"),
+                InlineKeyboardButton("5m", callback_data=f"chart:{symbol}:5m"),
+                InlineKeyboardButton("10m", callback_data=f"chart:{symbol}:10m")
+            ],
+            [
+                InlineKeyboardButton("1h", callback_data=f"chart:{symbol}:1h"),
+                InlineKeyboardButton("1w", callback_data=f"chart:{symbol}:1w")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_media(
+            media=InputMediaPhoto(buf),
+            reply_markup=reply_markup
+        )
+        await query.message.edit_caption(
+            caption=f"📊 **رسم بياني لـ {symbol} ({timeframe})**\nاختر إطارًا زمنيًا آخر:",
+            parse_mode='Markdown'
+        )
+
+    async def predict(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['predict'] += 1
+        symbol = context.args[0].upper() if context.args else self.config['default_symbol']
+        timeframes = {
+            '1m': 1,
+            '5m': 5,
+            '1h': 60
+        }
+        responses = []
+
+        for timeframe, horizon in timeframes.items():
+            df = await self.fetch_ohlcv(symbol, timeframe)
+            if df is None:
+                continue
+            current_price, predicted_price, trend, price_change, futures, confidence, reasons = await self.predict_price(df, symbol, horizon)
+            if current_price is None:
+                continue
+            response = (
+                f"🔮 **توقع {timeframe} لـ {symbol}**:\n"
+                f"💰 السعر الحالي: {current_price:.2f} USDT\n"
+                f"🎯 السعر المتوقع: {predicted_price:.2f} USDT\n"
+                f"📈 الاتجاه: {trend}\n"
+                f"📊 نسبة الثقة: {'█' * int(confidence // 10)}{' ' * (10 - int(confidence // 10))} {confidence:.1f}%\n"
+                f"📋 الأسباب:\n"
+            )
+            for reason in reasons:
+                response += f"- {reason}\n"
+            responses.append(response)
+
+        if responses:
+            await update.message.reply_text(
+                "\n".join(responses),
+                parse_mode='Markdown'
+            )
+            await self.send_to_log_group(f"تم إنشاء توقع لـ {symbol} من المستخدم {update.effective_user.first_name}")
+        else:
+            await update.message.reply_text(
+                f"⚠️ تعذر إنشاء توقع لـ {symbol}. حاول مرة أخرى.",
+                parse_mode='Markdown'
+            )
+
+    async def running(self, update: Update, context):
+        if not await self.check_access(update):
+            return
+        self.command_usage['running'] += 1
+        await update.message.reply_text(
+            f"🟢 **البوت يعمل بنجاح!** 🚀\n"
+            f"🕒 الوقت: {datetime.now().strftime('%I:%M %p EEST')}\n"
+            f"📍 المجموعة النشطة: {self.admin_settings['active_group_name'] or 'غير محددة'}",
+            parse_mode='Markdown'
+        )
+
+    async def handle_text(self, update: Update, context):
+        if not await self.check_access(update): # Initial check access
+            return
+
+        text = update.message.text.strip() # Ensure text is stripped
+
+        if text.startswith("سعر "): # Check for Arabic "price "
+            self.command_usage['price_text'] += 1
+            command_parts = text.split()[1:]
+            if not command_parts:
+                parsed_arg = None
+            else:
+                parsed_arg = self._parse_symbol_arg(command_parts)
+            await self._get_price_and_reply(update, context, parsed_arg)
+            return
+
+        # Alias for /search
+        elif text.startswith("بحث "): # "بحث BTC"
+            if not await self.check_access(update): return # Redundant if top check is kept, but safe
+            self.command_usage['search_text'] += 1
+            parts = update.message.text.strip().split()
+            context.args = parts[1:]
+            await self.search(update, context)
+            return
+        elif text == "بحث": # "بحث" - no args
+            if not await self.check_access(update): return
+            self.command_usage['search_text'] += 1
+            context.args = []
+            await self.search(update, context)
+            return
+
+        # Alias for /deal
+        elif text.startswith("صفقه "): # "صفقه BTC/USDT 10"
+            if not await self.check_access(update): return
+            self.command_usage['deal_text'] += 1
+            parts = update.message.text.strip().split()
+            context.args = parts[1:]
+            await self.deal(update, context)
+            return
+        elif text == "صفقه":
+            if not await self.check_access(update): return
+            self.command_usage['deal_text'] += 1
+            context.args = []
+            await self.deal(update, context)
+            return
+
+        # Alias for /chart
+        elif text.startswith("رسم "): # "رسم BTC/USDT"
+            if not await self.check_access(update): return
+            self.command_usage['chart_text'] += 1
+            parts = update.message.text.strip().split()
+            context.args = parts[1:]
+            await self.chart(update, context)
+            return
+        elif text == "رسم":
+            if not await self.check_access(update): return
+            self.command_usage['chart_text'] += 1
+            context.args = []
+            await self.chart(update, context)
+            return
+
+        # Alias for /predict
+        elif text.startswith("توقع "): # "توقع BTC/USDT"
+            if not await self.check_access(update): return
+            self.command_usage['predict_text'] += 1
+            parts = update.message.text.strip().split()
+            context.args = parts[1:]
+            await self.predict(update, context)
+            return
+        elif text == "توقع":
+            if not await self.check_access(update): return
+            self.command_usage['predict_text'] += 1
+            context.args = []
+            await self.predict(update, context)
+            return
+
+        # Existing help and status handlers (ensure they use .lower() if they need to be case-insensitive)
+        text_lower = text.lower()
+        if text_lower == "مساعدة":
+            await self.help(update, context)
+            return # Added return
+        elif text_lower == "حالة":
+            await self.running(update, context)
+            return # Added return
+
+        elif self.waiting_for_group_id and str(update.effective_user.id) == self.config['admin_id']:
+            # This specific condition might need text as is, if group_id is case-sensitive
+            await self.handle_group_id(update, context)
+            # No return here, as handle_group_id might not always be the end of processing if it's not a command
+
+async def main():
+    bot = TradingBot(CONFIG)
+    application = Application.builder().token(CONFIG['telegram_token']).build()
+    bot.application = application
+
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("help", bot.help))
+    application.add_handler(CommandHandler("price", bot.price))
+    application.add_handler(CommandHandler("search", bot.search))
+    application.add_handler(CommandHandler("deal", bot.deal))
+    application.add_handler(CommandHandler("chart", bot.chart))
+    application.add_handler(CommandHandler("predict", bot.predict))
+    application.add_handler(CommandHandler("running", bot.running))
+    application.add_handler(CommandHandler("admin", bot.admin_panel))
+    application.add_handler(CallbackQueryHandler(bot.handle_admin_callback, pattern='^(toggle_private|set_group|restart_bot|usage_stats|close_panel)$'))
+    application.add_handler(CallbackQueryHandler(bot.handle_chart_callback, pattern='^chart:'))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
+
+    try:
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        error_msg = f"خطأ في تشغيل البوت: {e}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        await bot.send_to_error_group(error_msg)
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
+[end of bot_v2.txt]
